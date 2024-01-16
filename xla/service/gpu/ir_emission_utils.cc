@@ -167,6 +167,11 @@ bool IsCustomCallToCusolver(const HloInstruction& hlo) {
   return hlo.custom_call_target() == kCusolverCholeskyCallTarget;
 }
 
+bool IsCustomCallToTopK(const HloInstruction& hlo) {
+  return hlo.opcode() == HloOpcode::kCustomCall &&
+         hlo.custom_call_target() == kTopKCustomCallTarget;
+}
+
 bool IsInputFusibleSlices(mlir::Operation* unnested_hlo,
                           bool verify_no_strides) {
   auto fusion = mlir::dyn_cast<mlir::lmhlo::FusionOp>(unnested_hlo);
@@ -282,6 +287,29 @@ llvm::Value* EmitNVPTXShflDown(llvm::Value* value, llvm::Value* offset,
       intrinsic, {b->getInt32(-1), value, offset, b->getInt32(WarpSize() - 1)});
 }
 
+// Helper function to emit call to SPIR shfl_down intrinsic.
+llvm::Value* EmitSPIRShflDown(llvm::Value* value, llvm::Value* offset,
+                              llvm::IRBuilder<>* b) {
+  CHECK_EQ(value->getType()->getPrimitiveSizeInBits(), 32);
+  if (value->getType()->isFloatTy()) {
+    return EmitDeviceFunctionCall(
+        "_Z34__spirv_GroupNonUniformShuffleDownffj",
+        {b->getInt32(3), value, offset}, {U32, F32, U32}, F32,
+        llvm::AttrBuilder(b->getContext())
+            .addAttribute(llvm::Attribute::NoUnwind)
+            .addAttribute(llvm::Attribute::Convergent),
+        b);
+  } else {
+    return EmitDeviceFunctionCall(
+        "_Z34__spirv_GroupNonUniformShuffleDownjjj",
+        {b->getInt32(3), value, offset}, {U32, U32, U32}, U32,
+        llvm::AttrBuilder(b->getContext())
+            .addAttribute(llvm::Attribute::NoUnwind)
+            .addAttribute(llvm::Attribute::Convergent),
+        b);
+  }
+}
+
 llvm::Value* EmitFullWarpShuffleDown(llvm::Value* value, llvm::Value* offset,
                                      llvm::IRBuilder<>* builder) {
   int bit_width = value->getType()->getPrimitiveSizeInBits();
@@ -294,6 +322,8 @@ llvm::Value* EmitFullWarpShuffleDown(llvm::Value* value, llvm::Value* offset,
       return EmitNVPTXShflDown(value, offset, builder);
     } else if (target_triple.getArch() == llvm::Triple::amdgcn) {
       return EmitAMDGPUShflDown(value, offset, builder);
+    } else if (target_triple.isSPIR()) {
+      return EmitSPIRShflDown(value, offset, builder);
     } else {
       LOG(FATAL) << "Invalid triple " << target_triple.str();
     }
@@ -315,6 +345,9 @@ llvm::Value* EmitFullWarpShuffleDown(llvm::Value* value, llvm::Value* offset,
     } else if (target_triple.getArch() == llvm::Triple::amdgcn) {
       insert_val = EmitAMDGPUShflDown(builder->CreateExtractElement(x, i),
                                       offset, builder);
+    } else if (target_triple.isSPIR()) {
+      insert_val = EmitSPIRShflDown(builder->CreateExtractElement(x, i), offset,
+                                    builder);
     } else {
       LOG(FATAL) << "Invalid triple " << target_triple.str();
     }
@@ -434,7 +467,7 @@ static int64_t GetAllocationIndex(mlir::BlockArgument func_arg,
   return func_arg.getArgNumber();
 }
 
-StatusOr<BufferAllocation::Slice> GetAllocationSlice(
+absl::StatusOr<BufferAllocation::Slice> GetAllocationSlice(
     mlir::Value v, absl::Span<const BufferAllocation* const> allocations,
     std::string* constant_name) {
   if (constant_name) {
@@ -551,7 +584,7 @@ absl::InlinedVector<const HloInstruction*, 4> GetStartIndices(T instr) {
   return result;
 }
 
-StatusOr<bool> CanEmitFusedDynamicUpdateSliceInPlaceForGpu(
+absl::StatusOr<bool> CanEmitFusedDynamicUpdateSliceInPlaceForGpu(
     const HloFusionInstruction* fusion,
     const BufferAssignment* buffer_assignment,
     const std::vector<const HloInstruction*>& roots) {
@@ -990,17 +1023,17 @@ std::optional<HloInstructionAdaptor> FindTransposeHero(
       // hero.
       if (transpose) {
         transpose = std::nullopt;
-        return TraversalResult::kAbortTraversal;
+        return TraversalResult::kInterrupt;
       }
       transpose = node;
-      return TraversalResult::kDoNotVisitOperands;
+      return TraversalResult::kSkip;
     }
 
     if (!IsIntermediate(&node.instruction(), /*allowed_operand_count=*/3)) {
       non_trivial.push_back(node);
-      return TraversalResult::kDoNotVisitOperands;
+      return TraversalResult::kSkip;
     }
-    return TraversalResult::kVisitOperands;
+    return TraversalResult::kAdvance;
   };
   HloBfsConsumersFirstTraversal({root}, fusion, visit);
 
@@ -1012,9 +1045,9 @@ std::optional<HloInstructionAdaptor> FindTransposeHero(
     auto visit_nt = [&transpose](HloInstructionAdaptor node) {
       if (node == transpose) {
         transpose = std::nullopt;
-        return TraversalResult::kAbortTraversal;
+        return TraversalResult::kInterrupt;
       }
-      return TraversalResult::kVisitOperands;
+      return TraversalResult::kAdvance;
     };
     HloBfsConsumersFirstTraversal(non_trivial, fusion, visit_nt);
   }
@@ -1187,7 +1220,12 @@ bool IsAMDGPU(const llvm::Module* module) {
   return llvm::Triple(module->getTargetTriple()).isAMDGPU();
 }
 
-StatusOr<DenseDataIntermediate> LiteralToXlaFormat(const Literal& literal) {
+bool IsSPIR(const llvm::Module* module) {
+  return llvm::Triple(module->getTargetTriple()).isSPIR();
+}
+
+absl::StatusOr<DenseDataIntermediate> LiteralToXlaFormat(
+    const Literal& literal) {
   PrimitiveType element_type = literal.shape().element_type();
   if (!primitive_util::IsArrayType(element_type)) {
     return Internal("Unsupported type in LiteralToXlaFormat");

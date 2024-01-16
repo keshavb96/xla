@@ -32,11 +32,13 @@ class TritonFusion : public FusionInterface {
   explicit TritonFusion(const HloFusionAnalysis& analysis)
       : analysis_(analysis) {}
 
-  StatusOr<FusionEmissionResult> Emit(
+  absl::StatusOr<FusionEmissionResult> Emit(
       IrEmitterContext& ir_emitter_context, mlir::lmhlo::FusionOp fusion_op,
       const HloFusionInstruction& fusion) const final;
 
-  std::optional<LaunchDimensions> launch_dimensions() const override;
+  // Returns the launch dimensions for softmax fusions. Not supported for
+  // MatMul fusions.
+  std::optional<LaunchDimensions> launch_dimensions() const;
 
  private:
   const HloFusionAnalysis& analysis_;

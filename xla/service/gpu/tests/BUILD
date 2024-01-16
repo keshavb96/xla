@@ -672,11 +672,14 @@ xla_cc_binary(
         "//xla/stream_executor:device_description",
         "//xla/stream_executor:dnn",
         "//xla/stream_executor/host:host_platform",
+        "//xla/stream_executor/rocm:rocm_platform_id",
         "//xla/tests:test_utils",
         "//xla/tools:hlo_module_loader",
+        "@com_google_absl//absl/status",
         "@llvm-project//llvm:Target",
         "@tsl//tsl/platform:logging",
         "@tsl//tsl/platform:platform_port",
+        "@tsl//tsl/platform:rocm_rocdl_path",
         "@tsl//tsl/util:command_line_flags",
     ] + if_cuda_is_configured([
         "//xla/stream_executor/cuda:cuda_platform_id",
@@ -807,10 +810,15 @@ xla_test(
     ],
 )
 
-xla_cc_test(
+xla_test(
     name = "gpu_fused_mha_test",
     srcs = ["gpu_fused_mha_test.cc"],
-    tags = tf_cuda_tests_tags(),
+    backend_tags = {"gpu": [
+        "requires-gpu-sm80",
+    ]},
+    backends = [
+        "gpu",
+    ],
     deps = [
         ":gpu_codegen_test",
         "//xla:array4d",
@@ -835,6 +843,7 @@ xla_cc_test(
         "//xla/tests:test_macros_header",
         "//xla/tests:test_utils",
         "//xla/tests:xla_internal_test_main",
+        "@com_google_absl//absl/status:statusor",
         "@com_google_absl//absl/strings",
         "@com_google_absl//absl/strings:str_format",
         "@com_google_googletest//:gtest",
